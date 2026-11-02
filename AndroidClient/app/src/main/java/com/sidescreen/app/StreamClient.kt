@@ -6,10 +6,7 @@ import android.net.ConnectivityManager
 import android.net.NetworkCapabilities
 import android.os.Process
 import android.util.Log
-import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.asCoroutineDispatcher
-import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.io.DataInputStream
 import java.io.IOException
@@ -17,7 +14,7 @@ import java.net.Socket
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.util.concurrent.Executors
-import java.util.concurrent.TimeUnit
+import java.util.concurrent.RejectedExecutionException
 
 class StreamClient(
     private val host: String,
@@ -27,7 +24,7 @@ class StreamClient(
     private var socket: Socket? = null
     private var inputStream: DataInputStream? = null
     private var outputStream: java.io.DataOutputStream? = null
-    private var isConnected = false
+    @Volatile private var isConnected = false
 
     // Callback includes actual frame size (may differ from buffer.size due to pooling),
     // receive timestamp, and whether the frame can restart HEVC decoding.
@@ -116,8 +113,86 @@ class StreamClient(
                 priority = Thread.MAX_PRIORITY
             }
         }
-    private val touchDispatcher = touchExecutor.asCoroutineDispatcher()
-    private val touchScope = CoroutineScope(touchDispatcher)
+    private data class Outbound(val bytes: ByteArray, val moveKey: String? = null, val isInput: Boolean = false)
+    private val outboundLock = Any()
+    private val outbound = ArrayDeque<Outbound>()
+    private var writerScheduled = false
+    private var writerClosed = false
+    private val inputProtocolLock = Any()
+    private var acceptedInputSession: Long? = null
+    private var gestureInputSession: Long? = null
+    private var inputSequence = 0L
+    private var inputContactCount = 0
+    private var legacyContacts: List<TouchInputContact> = emptyList()
+
+    /** One writer preserves event boundaries. Only consecutive, unsent MOVE samples coalesce. */
+    private fun enqueueOutput(bytes: ByteArray, moveKey: String? = null, cancelInput: Boolean = false, isInput: Boolean = false) {
+        if (!isConnected) return
+        var schedule = false
+        var overflow = false
+        synchronized(outboundLock) {
+            if (writerClosed) return
+            // Cancellation invalidates outstanding input, including an old UP
+            // that could otherwise click after the view has lost focus.
+            if (cancelInput) outbound.removeAll { it.isInput }
+            if (moveKey != null && outbound.lastOrNull()?.moveKey == moveKey) {
+                outbound.removeLast()
+            }
+            if (outbound.size >= 256) {
+                overflow = true
+                writerClosed = true
+                outbound.clear()
+            } else {
+                outbound.addLast(Outbound(bytes, moveKey, isInput))
+                if (!writerScheduled) {
+                    writerScheduled = true
+                    schedule = true
+                }
+            }
+        }
+        if (overflow) {
+            Log.w(TAG, "Input writer overflow; closing connection to release remote input")
+            try { socket?.close() } catch (_: IOException) { }
+            return
+        }
+        if (schedule) {
+            try {
+                touchExecutor.execute { drainOutput() }
+            } catch (_: RejectedExecutionException) {
+                synchronized(outboundLock) {
+                    writerScheduled = false
+                    outbound.clear()
+                }
+            }
+        }
+    }
+
+    private fun drainOutput() {
+        while (true) {
+            val item = synchronized(outboundLock) {
+                if (writerClosed || outbound.isEmpty()) {
+                    writerScheduled = false
+                    null
+                } else {
+                    outbound.removeFirst()
+                }
+            } ?: return
+            try {
+                val out = outputStream ?: return
+                out.write(item.bytes)
+                out.flush()
+            } catch (e: IOException) {
+                if (isConnected) Log.w(TAG, "Input write failed", e)
+                synchronized(outboundLock) {
+                    writerClosed = true
+                    writerScheduled = false
+                    outbound.clear()
+                }
+                try { socket?.close() } catch (_: IOException) { }
+                return
+            }
+        }
+    }
 
     suspend fun connect() =
         withContext(Dispatchers.IO) {
@@ -138,6 +213,7 @@ class StreamClient(
                 advertiseDecoderLimits() // Also before type 8, for the same reason
                 advertiseDesktopGeometrySupport() // Likewise
                 advertiseIdentity() // Likewise: the Mac picks this tablet's profile when type 8 lands
+                advertiseInputV2Support()
                 advertiseFrameMetadataSupport()
                 isConnected = true
                 lastKeyframeReceivedNs = 0L
@@ -364,6 +440,7 @@ class StreamClient(
                 advertiseDecoderLimits() // Also before type 8, for the same reason
                 advertiseDesktopGeometrySupport() // Likewise
                 advertiseIdentity() // Likewise: the Mac picks this tablet's profile when type 8 lands
+                advertiseInputV2Support()
                 advertiseFrameMetadataSupport()
                 isConnected = true
                 diagLog("Wireless connected to $host:$port")
@@ -392,6 +469,14 @@ class StreamClient(
             out.writeByte(MESSAGE_CLIENT_SUPPORTS_DESKTOP_GEOMETRY)
             out.flush()
             diagLog("Advertised desktop-geometry support")
+        }
+    }
+
+    private fun advertiseInputV2Support() {
+        outputStream?.let { out ->
+            // A payload-free advertisement is safe for old hosts that skip unknown bytes.
+            out.writeByte(TouchInputFrame.MESSAGE_CAPABILITY)
+            out.flush()
         }
     }
 
@@ -496,6 +581,16 @@ class StreamClient(
                     val type = input.readByte()
 
                     when (type.toInt()) {
+                        TouchInputFrame.MESSAGE_ACCEPTED -> {
+                            val version = input.readUnsignedByte()
+                            val token = ByteArray(8)
+                            input.readFully(token)
+                            if (version != 2) throw IOException("Unsupported input version $version")
+                            synchronized(inputProtocolLock) {
+                                acceptedInputSession = ByteBuffer.wrap(token).order(ByteOrder.LITTLE_ENDIAN).long
+                            }
+                            diagLog("Input v2 accepted; activates at the next complete gesture")
+                        }
                         MESSAGE_VIDEO_FRAME -> {
                             receiveVideoFrame(input, hasMetadata = false)
                         }
@@ -557,37 +652,71 @@ class StreamClient(
             }
         }
 
-    fun sendTouch(
-        x: Float,
-        y: Float,
-        action: Int,
-        pointerCount: Int = 1,
-        x2: Float = 0f,
-        y2: Float = 0f,
+    internal fun sendTouchFrame(
+        frame: TouchInputFrame,
+        flipHorizontal: Boolean,
+        flipVertical: Boolean,
     ) {
         if (!isConnected) return
-
-        touchScope.launch {
-            try {
-                socket?.getOutputStream()?.let { out ->
-                    val count = pointerCount.coerceIn(1, 2)
-                    val size = 6 + count * 8 // 1 type + 1 count + N*(4x+4y) + 4 action
-                    val buffer = ByteBuffer.allocate(size).order(ByteOrder.LITTLE_ENDIAN)
-                    buffer.put(2.toByte())
-                    buffer.put(count.toByte())
-                    buffer.putFloat(x)
-                    buffer.putFloat(y)
-                    if (count == 2) {
-                        buffer.putFloat(x2)
-                        buffer.putFloat(y2)
-                    }
-                    buffer.putInt(action)
-                    out.write(buffer.array())
-                    out.flush()
-                }
-            } catch (_: Exception) {
+        synchronized(inputProtocolLock) {
+            if (frame.phase == TouchInputFrame.DOWN && inputContactCount == 0) {
+                // Never change wire protocols halfway through a touch sequence.
+                gestureInputSession = acceptedInputSession
+                inputContactCount = 0
             }
+            val session = gestureInputSession ?: if (frame.phase == TouchInputFrame.CANCEL && inputContactCount == 0) {
+                acceptedInputSession
+            } else null
+            // Old hosts cannot cancel an idle gesture or inertia. Sending a
+            // fabricated UP while idle would be less safe than doing nothing.
+            if (frame.phase == TouchInputFrame.CANCEL && inputContactCount == 0 && session == null) return
+            val key = if (frame.phase == TouchInputFrame.MOVE) {
+                "${session ?: "legacy"}:${frame.contacts.joinToString(",") { it.id.toString() }}"
+            } else null
+            val bytes = if (session != null) {
+                frame.encode(session, ++inputSequence)
+            } else {
+                encodeLegacyTouch(frame, flipHorizontal, flipVertical)
+            }
+            enqueueOutput(bytes, key, cancelInput = frame.phase == TouchInputFrame.CANCEL, isInput = true)
+            inputContactCount = when (frame.phase) {
+                TouchInputFrame.CANCEL, TouchInputFrame.UP -> 0
+                TouchInputFrame.POINTER_UP -> (frame.contacts.size - 1).coerceAtLeast(0)
+                else -> frame.contacts.size
+            }
+            legacyContacts = when (frame.phase) {
+                TouchInputFrame.CANCEL, TouchInputFrame.UP -> emptyList()
+                TouchInputFrame.POINTER_UP -> frame.contacts.filter { it.id != frame.changedPointerId }
+                else -> frame.contacts
+            }
+            if (inputContactCount == 0) gestureInputSession = null
         }
+    }
+
+    private fun encodeLegacyTouch(
+        frame: TouchInputFrame,
+        flipHorizontal: Boolean,
+        flipVertical: Boolean,
+    ): ByteArray {
+        // Legacy hosts have no CANCEL phase. An UP is the best available release;
+        // the new host uses v2 and never mistakes cancellation for a click.
+        val contacts = frame.contacts.ifEmpty { legacyContacts.take(1) }.ifEmpty {
+            listOf(TouchInputContact(0, 0.5f, 0.5f, 0))
+        }.take(2)
+        val action = when (frame.phase) {
+            TouchInputFrame.DOWN, TouchInputFrame.POINTER_DOWN -> 0
+            TouchInputFrame.MOVE -> 1
+            else -> 2
+        }
+        return ByteBuffer.allocate(6 + contacts.size * 8).order(ByteOrder.LITTLE_ENDIAN).apply {
+            put(2.toByte())
+            put(contacts.size.toByte())
+            contacts.forEach {
+                putFloat(if (flipHorizontal) 1f - it.x else it.x)
+                putFloat(if (flipVertical) 1f - it.y else it.y)
+            }
+            putInt(action)
+        }.array()
     }
 
     // Callback for latency measurement (round-trip ping/pong)
@@ -623,15 +752,7 @@ class StreamClient(
 
         val flags = if (force) KEYFRAME_REQUEST_FLAG_FORCE else 0
         diagLog("Requesting keyframe: reason=$reason, force=$force")
-        touchScope.launch {
-            try {
-                outputStream?.let { out ->
-                    out.write(byteArrayOf(MESSAGE_KEYFRAME_REQUEST.toByte(), flags.toByte()))
-                    out.flush()
-                }
-            } catch (_: Exception) {
-            }
-        }
+        enqueueOutput(byteArrayOf(MESSAGE_KEYFRAME_REQUEST.toByte(), flags.toByte()))
     }
 
     /**
@@ -639,18 +760,10 @@ class StreamClient(
      */
     fun sendPing() {
         if (!isConnected) return
-        touchScope.launch {
-            try {
-                socket?.getOutputStream()?.let { out ->
-                    val buffer = ByteBuffer.allocate(9).order(ByteOrder.LITTLE_ENDIAN)
-                    buffer.put(4.toByte()) // Type 4: ping
-                    buffer.putLong(System.nanoTime())
-                    out.write(buffer.array())
-                    out.flush()
-                }
-            } catch (_: Exception) {
-            }
-        }
+        val buffer = ByteBuffer.allocate(9).order(ByteOrder.LITTLE_ENDIAN)
+        buffer.put(4.toByte())
+        buffer.putLong(System.nanoTime())
+        enqueueOutput(buffer.array())
     }
 
     private fun updateStats(bytes: Int) {
@@ -746,26 +859,24 @@ class StreamClient(
     }
 
     private fun cleanup() {
-        try {
-            outputStream?.close()
-            inputStream?.close()
-            socket?.close()
-
-            // Properly shutdown executor with timeout to prevent orphaned threads
-            touchExecutor.shutdown()
-            try {
-                if (!touchExecutor.awaitTermination(500, TimeUnit.MILLISECONDS)) {
-                    touchExecutor.shutdownNow()
-                    // Wait a bit more for forced shutdown
-                    touchExecutor.awaitTermination(200, TimeUnit.MILLISECONDS)
-                }
-            } catch (e: InterruptedException) {
-                touchExecutor.shutdownNow()
-                Thread.currentThread().interrupt()
-            }
-        } catch (e: Exception) {
-            Log.e(TAG, "Error during cleanup", e)
+        isConnected = false
+        synchronized(outboundLock) {
+            writerClosed = true
+            writerScheduled = false
+            outbound.clear()
         }
+        synchronized(inputProtocolLock) {
+            acceptedInputSession = null
+            gestureInputSession = null
+            inputContactCount = 0
+            legacyContacts = emptyList()
+        }
+        // Closing the socket first also unblocks any writer/read currently inside IO.
+        // Never wait on the UI thread, or await this executor from its own worker.
+        try { socket?.close() } catch (_: IOException) { }
+        try { outputStream?.close() } catch (_: IOException) { }
+        try { inputStream?.close() } catch (_: IOException) { }
+        touchExecutor.shutdownNow()
         outputStream = null
         inputStream = null
         socket = null

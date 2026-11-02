@@ -476,26 +476,7 @@ struct SettingsView: View {
 
                         // Touch Control
                         FrostedGroupBox(title: "Touch Control", icon: "hand.tap") {
-                            VStack(alignment: .leading, spacing: 8) {
-                                HStack {
-                                    VStack(alignment: .leading, spacing: 2) {
-                                        Text("Enable Touch Input")
-                                            .font(.system(size: 12, weight: .medium))
-                                        Text("Control Mac from tablet touch")
-                                            .font(.system(size: 10))
-                                            .foregroundColor(.secondary)
-                                    }
-                                    Spacer()
-                                    Toggle("", isOn: $settings.touchEnabled)
-                                        .labelsHidden()
-                                }
-
-                                if !settings.touchEnabled {
-                                    Text("Touch input is disabled — tablet is display-only")
-                                        .font(.system(size: 10))
-                                        .foregroundColor(.orange)
-                                }
-                            }
+                            TouchControlSettingsView(settings: settings)
                         }
 
                         // Network Settings (port — applies to both modes; listener binds on it)
@@ -1192,6 +1173,179 @@ struct RotationButton: View {
     }
 }
 
+// MARK: - Touch Settings
+
+private struct TouchControlSettingsView: View {
+    @ObservedObject var settings: DisplaySettings
+    @State private var showZoomSettings = false
+    @State private var selectedBundleID = "com.apple.Safari"
+    @State private var applications: [ZoomApplicationChoice] = []
+
+    private struct ZoomApplicationChoice: Identifiable {
+        let id: String
+        let name: String
+    }
+
+    private var activeBundleID: String {
+        selectedBundleID.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private var validBundleID: Bool {
+        !activeBundleID.isEmpty && activeBundleID.contains(".") && !activeBundleID.contains(where: \.isWhitespace)
+    }
+
+    private var appBinding: TouchZoomBinding {
+        settings.zoomBindings[activeBundleID] ?? TouchZoomBinding()
+    }
+
+    private func updateAppBinding(_ change: (inout TouchZoomBinding) -> Void) {
+        guard validBundleID else { return }
+        var binding = appBinding
+        change(&binding)
+        settings.zoomBindings[activeBundleID] = binding
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Toggle("Enable Touch Input", isOn: $settings.touchEnabled)
+                .font(.system(size: 12, weight: .medium))
+
+            if settings.touchEnabled {
+                Picker("Mode", selection: $settings.touchPreferences.mode) {
+                    ForEach(TouchMode.allCases, id: \.self) { Text($0.title).tag($0) }
+                }
+                .pickerStyle(.segmented)
+
+                Text(settings.touchPreferences.mode == .reading
+                     ? "One finger scrolls. Hold, then move to drag."
+                     : "Move one finger to drag. Two fingers scroll.")
+                    .font(.system(size: 10))
+                    .foregroundColor(.secondary)
+
+                Toggle("Content Follows Finger", isOn: $settings.touchPreferences.followFinger)
+                HStack {
+                    Text("Sensitivity")
+                    Slider(value: $settings.touchPreferences.sensitivity, in: 0.5...2, step: 0.1)
+                    Text(String(format: "%.1f×", settings.touchPreferences.sensitivity))
+                        .monospacedDigit()
+                        .frame(width: 35, alignment: .trailing)
+                }
+                Picker("Momentum", selection: $settings.touchPreferences.momentum) {
+                    ForEach(TouchMomentum.allCases, id: \.self) { Text($0.title).tag($0) }
+                }
+                .pickerStyle(.segmented)
+                Text("Tap a moving page to stop it without clicking.")
+                    .font(.system(size: 10))
+                    .foregroundColor(.secondary)
+                Toggle("Keep Scrolling on the Main Axis", isOn: $settings.touchPreferences.axisLock)
+
+                DisclosureGroup("Pinch Zoom", isExpanded: $showZoomSettings) {
+                    zoomSettings
+                        .padding(.top, 5)
+                }
+
+                Toggle("Touch Diagnostics", isOn: $settings.touchPreferences.diagnostics)
+                if !settings.touchStatus.isEmpty {
+                    Text(settings.touchStatus)
+                        .font(.system(size: 10))
+                        .foregroundColor(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                        .textSelection(.enabled)
+                }
+            } else {
+                Text("Touch input is disabled — tablet is display-only")
+                    .font(.system(size: 10))
+                    .foregroundColor(.orange)
+            }
+        }
+        .font(.system(size: 11))
+        .toggleStyle(.switch)
+        .onAppear(perform: refreshApplications)
+    }
+
+    private var zoomSettings: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text("Pinch to zoom the app under your fingers. Automatic supports Safari, Chrome and Preview.")
+                .font(.system(size: 10))
+                .foregroundColor(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+
+            HStack {
+                Menu("Choose Application") {
+                    ForEach(applications) { app in
+                        Button(app.name) { selectedBundleID = app.id }
+                    }
+                }
+                Button(action: refreshApplications) {
+                    Image(systemName: "arrow.clockwise")
+                }
+                .help("Refresh running applications")
+            }
+            TextField("Application bundle ID", text: $selectedBundleID)
+                .textFieldStyle(.roundedBorder)
+                .help("Choose a running app, or enter its bundle ID.")
+
+            Picker("Zoom Method", selection: Binding(
+                get: { appBinding.method },
+                set: { value in updateAppBinding { $0.method = value } }
+            )) {
+                ForEach(TouchZoomMethod.allCases, id: \.self) { Text($0.title).tag($0) }
+            }
+            .disabled(!validBundleID)
+
+            if appBinding.method == .shortcuts {
+                TextField("Zoom in (for example cmd+=)", text: Binding(
+                    get: { appBinding.zoomInShortcut },
+                    set: { value in updateAppBinding { $0.zoomInShortcut = value } }
+                ))
+                .textFieldStyle(.roundedBorder)
+                TextField("Zoom out (for example cmd+-)", text: Binding(
+                    get: { appBinding.zoomOutShortcut },
+                    set: { value in updateAppBinding { $0.zoomOutShortcut = value } }
+                ))
+                .textFieldStyle(.roundedBorder)
+                Text("Combine cmd, ctrl, option or shift with a key, separated by +.")
+                    .font(.system(size: 10))
+                    .foregroundColor(.secondary)
+            } else if appBinding.method == .commandWheel || appBinding.method == .controlWheel || appBinding.method == .optionWheel {
+                Text("The app must support this scroll shortcut. A macOS screen-zoom shortcut may enlarge the entire screen.")
+                    .font(.system(size: 10))
+                    .foregroundColor(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            } else if appBinding.method == .automatic {
+                Text("Other apps need a supported scroll shortcut or custom zoom shortcuts. Pinching never falls back to ordinary scrolling.")
+                    .font(.system(size: 10))
+                    .foregroundColor(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
+            if settings.zoomBindings[activeBundleID] != nil {
+                Button("Reset This App to Automatic") {
+                    settings.zoomBindings.removeValue(forKey: activeBundleID)
+                }
+                .disabled(!validBundleID)
+            }
+        }
+    }
+
+    private func refreshApplications() {
+        var choices: [String: String] = [
+            "com.apple.Safari": "Safari",
+            "com.google.Chrome": "Google Chrome",
+            "com.apple.Preview": "Preview"
+        ]
+        for app in NSWorkspace.shared.runningApplications where app.activationPolicy == .regular {
+            guard let bundle = app.bundleIdentifier else { continue }
+            choices[bundle] = app.localizedName ?? bundle
+        }
+        for bundle in settings.zoomBindings.keys where choices[bundle] == nil {
+            choices[bundle] = bundle
+        }
+        applications = choices.map { ZoomApplicationChoice(id: $0.key, name: $0.value) }
+            .sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
+    }
+}
+
 // MARK: - Display Settings
 
 class DisplaySettings: ObservableObject {
@@ -1240,6 +1394,12 @@ class DisplaySettings: ObservableObject {
     @Published var touchEnabled: Bool {
         didSet { save("touchEnabled", touchEnabled) }
     }
+    @Published var touchPreferences: TouchPreferences {
+        didSet { saveEncoded("touchPreferences", touchPreferences) }
+    }
+    @Published var zoomBindings: [String: TouchZoomBinding] {
+        didSet { saveEncoded("zoomBindings", zoomBindings) }
+    }
     @Published var connectionMode: ConnectionMode {
         didSet { save("connectionMode", connectionMode.rawValue) }
     }
@@ -1276,6 +1436,7 @@ class DisplaySettings: ObservableObject {
     @Published var currentFPS: Double = 0
     @Published var currentBitrate: Double = 0
     @Published var captureMethod: String = "Initializing..."
+    @Published var touchStatus: String = ""
 
     var onToggleServer: (() -> Void)?
 
@@ -1296,6 +1457,10 @@ class DisplaySettings: ObservableObject {
         self.customWidth = defaults.object(forKey: keyPrefix + "customWidth") as? Int ?? 1920
         self.customHeight = defaults.object(forKey: keyPrefix + "customHeight") as? Int ?? 1200
         self.touchEnabled = defaults.object(forKey: keyPrefix + "touchEnabled") as? Bool ?? true
+        self.touchPreferences = defaults.data(forKey: keyPrefix + "touchPreferences")
+            .flatMap { try? JSONDecoder().decode(TouchPreferences.self, from: $0) } ?? TouchPreferences()
+        self.zoomBindings = defaults.data(forKey: keyPrefix + "zoomBindings")
+            .flatMap { try? JSONDecoder().decode([String: TouchZoomBinding].self, from: $0) } ?? [:]
         let modeRaw = defaults.string(forKey: keyPrefix + "connectionMode") ?? ConnectionMode.usb.rawValue
         self.connectionMode = ConnectionMode(rawValue: modeRaw) ?? .usb
         self.autoStartStreamingOnLaunch = defaults.object(forKey: keyPrefix + "autoStartStreamingOnLaunch") as? Bool ?? false
@@ -1307,6 +1472,11 @@ class DisplaySettings: ObservableObject {
 
     private func save(_ key: String, _ value: Any) {
         defaults.set(value, forKey: keyPrefix + key)
+    }
+
+    private func saveEncoded<Value: Encodable>(_ key: String, _ value: Value) {
+        guard let data = try? JSONEncoder().encode(value) else { return }
+        defaults.set(data, forKey: keyPrefix + key)
     }
 
     /// The tablet-specific slice of the settings, plus the display position
@@ -1325,7 +1495,8 @@ class DisplaySettings: ObservableObject {
             gamingBoost: gamingBoost,
             touchEnabled: touchEnabled,
             positionX: hasPosition ? defaults.integer(forKey: keyPrefix + "positionX") : nil,
-            positionY: hasPosition ? defaults.integer(forKey: keyPrefix + "positionY") : nil
+            positionY: hasPosition ? defaults.integer(forKey: keyPrefix + "positionY") : nil,
+            touchPreferences: touchPreferences
         )
     }
 
@@ -1342,6 +1513,8 @@ class DisplaySettings: ObservableObject {
         if quality != profile.quality { quality = profile.quality }
         if gamingBoost != profile.gamingBoost { gamingBoost = profile.gamingBoost }
         if touchEnabled != profile.touchEnabled { touchEnabled = profile.touchEnabled }
+        let restoredTouch = profile.touchPreferences ?? TouchPreferences()
+        if touchPreferences != restoredTouch { touchPreferences = restoredTouch }
         if let x = profile.positionX, let y = profile.positionY {
             save("positionX", x)
             save("positionY", y)
@@ -1406,7 +1579,7 @@ class DisplaySettings: ObservableObject {
     func resetToDefaults() {
         let keys = ["resolution", "refreshRate", "hiDPI", "bitrate", "quality",
                     "gamingBoost", "port", "rotation", "flipHorizontal", "flipVertical", "showAllResolutions",
-                    "customWidth", "customHeight", "touchEnabled", "autoStartStreamingOnLaunch", "startupMode"]
+                    "customWidth", "customHeight", "touchEnabled", "touchPreferences", "zoomBindings", "autoStartStreamingOnLaunch", "startupMode"]
         for key in keys {
             defaults.removeObject(forKey: keyPrefix + key)
         }
@@ -1425,6 +1598,9 @@ class DisplaySettings: ObservableObject {
         customWidth = 1920
         customHeight = 1200
         touchEnabled = true
+        touchPreferences = TouchPreferences()
+        zoomBindings = [:]
+        touchStatus = ""
         autoStartStreamingOnLaunch = false
         startupMode = .usb
 

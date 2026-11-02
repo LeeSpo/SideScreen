@@ -18,6 +18,8 @@ struct ProfileSettings: Codable, Equatable {
     /// Display origin in the arrangement; nil until one was saved.
     var positionX: Int?
     var positionY: Int?
+    /// Optional so profiles saved before touch controls keep decoding unchanged.
+    var touchPreferences: TouchPreferences? = nil
 
     /// Everything the virtual display and its capture are built from. A change
     /// here needs both rebuilt; everything else applies live. Gaming Boost is

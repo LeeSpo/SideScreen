@@ -15,8 +15,8 @@ android {
         applicationId = "com.sidescreen.app.booxfix"
         minSdk = 26
         targetSdk = 36
-        versionCode = computedVersionCode
-        versionName = "$appVersion-booxfix.3-light"
+        versionCode = computedVersionCode + 1
+        versionName = "$appVersion-booxfix.4-touch"
     }
 
     // Release signing: reads the upload key from env vars (set as GitHub Secrets in CI,

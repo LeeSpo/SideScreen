@@ -40,6 +40,9 @@ private enum WireMessage {
     /// BEFORE type 8, so the host knows which profile to apply before the
     /// display config goes out.
     static let clientIdentity: UInt8 = 18
+    static let clientSupportsInputV2: UInt8 = 19
+    static let inputV2Accepted: UInt8 = 20
+    static let inputV2Frame: UInt8 = 21
 }
 
 private extension String {
@@ -170,6 +173,8 @@ class StreamingServer {
     var onCodecNegotiated: ((StreamCodec) -> Void)?
     // Touch callback: (x1, y1, action, pointerCount, x2, y2)
     var onTouchEvent: ((Float, Float, Int, Int, Float, Float) -> Void)?
+    var onInputFrame: ((TouchInputFrame) -> Void)?
+    var onInputReset: ((String) -> Void)?
     var onStats: ((Double, Double) -> Void)?
     var onKeyframeRequested: ((Bool) -> Void)?
     // Whether host wants to receive touch events from client. Ping/pong is
@@ -264,6 +269,29 @@ class StreamingServer {
     private var desktopWidth = 0
     private var desktopHeight = 0
     private var inputBuffer = Data()
+    private var inputSessionToken: UInt64 = 0
+    private var inputV2Negotiated = false
+    private var lastInputSequence: UInt64?
+    private var lastInputTimestamp: UInt64?
+    private let inputDeliveryLock = NSLock()
+    private var inputGeneration: UInt64 = 0
+    private var inputDrainScheduled = false
+    private enum InputDelivery {
+        case legacy(Float, Float, Int, Int, Float, Float)
+        case frame(TouchInputFrame)
+        case reset(String)
+
+        func canReplace(_ previous: InputDelivery) -> Bool {
+            switch (previous, self) {
+            case let (.legacy(_, _, oldAction, oldCount, _, _), .legacy(_, _, action, count, _, _)):
+                return oldAction == 1 && action == 1 && oldCount == count
+            case let (.frame(old), .frame(new)):
+                return old.phase == .move && new.phase == .move && old.contacts.map(\.id) == new.contacts.map(\.id)
+            default: return false
+            }
+        }
+    }
+    private var pendingInput: [(UInt64, InputDelivery)] = []
 
     init(port: UInt16) {
         self.port = port
@@ -358,10 +386,15 @@ class StreamingServer {
         debugLog("New connection incoming...")
 
         // Clean up old connection properly
-        if let oldConnection = connection {
-            isReceiving = false
-            oldConnection.cancel()
-        }
+        let oldConnection = connection
+        connection = newConnection
+        isReceiving = false
+        oldConnection?.cancel()
+        inputSessionToken = UInt64.random(in: 1...UInt64.max)
+        inputV2Negotiated = false
+        lastInputSequence = nil
+        lastInputTimestamp = nil
+        resetInputDelivery(reason: "connection replaced")
 
         connectionReady = false
         clientSupportsFrameMetadata = false
@@ -379,16 +412,17 @@ class StreamingServer {
         droppedFrames = 0
 
         connection?.stateUpdateHandler = { [weak self] state in
+            guard let self, self.connection === newConnection, !self.isStopped else { return }
             debugLog("Connection state: \(state)")
             switch state {
             case .ready:
-                self?.onConnectionReady(newConnection)
+                self.onConnectionReady(newConnection)
             case .failed(let error):
                 debugLog("Connection failed: \(error)")
-                self?.onClientDisconnected?()
+                self.finishInputConnection(newConnection, reason: "connection failed")
             case .cancelled:
                 debugLog("Connection cancelled")
-                self?.onClientDisconnected?()
+                self.finishInputConnection(newConnection, reason: "connection cancelled")
             default:
                 break
             }
@@ -668,6 +702,7 @@ class StreamingServer {
     }
 
     private func startReceivingTouch() {
+        guard let receivingConnection = connection else { return }
         guard !isReceiving else {
             debugLog("Already receiving touch events")
             return
@@ -677,22 +712,19 @@ class StreamingServer {
 
         // Use loop-based pattern instead of recursion to prevent stack overflow
         receiveQueue.async { [weak self] in
-            self?.touchReceiveLoop()
+            self?.touchReceiveLoop(on: receivingConnection)
         }
     }
 
-    private func touchReceiveLoop() {
-        guard let connection = connection, isReceiving, !isStopped else {
-            isReceiving = false
-            return
-        }
+    private func touchReceiveLoop(on connection: NWConnection) {
+        guard self.connection === connection, isReceiving, !isStopped else { return }
 
         connection.receive(minimumIncompleteLength: 1, maximumLength: 256) { [weak self] data, _, isComplete, error in
-            guard let self = self, self.isReceiving, !self.isStopped else { return }
+            guard let self = self, self.connection === connection, self.isReceiving, !self.isStopped else { return }
 
             if error != nil || isComplete {
-                self.isReceiving = false
-                self.inputBuffer.removeAll(keepingCapacity: true)
+                self.finishInputConnection(connection, reason: "input stream closed")
+                connection.cancel()
                 return
             }
 
@@ -702,7 +734,7 @@ class StreamingServer {
             }
 
             self.receiveQueue.async {
-                self.touchReceiveLoop()
+                self.touchReceiveLoop(on: connection)
             }
         }
     }
@@ -732,6 +764,45 @@ class StreamingServer {
                 // this touch frame so coalesced ping/keyframe messages survive.
                 if touchEnabled {
                     handleTouchMessage(message, pointerCount: pointerCount)
+                }
+
+            case WireMessage.clientSupportsInputV2:
+                consumeInputBytes(1)
+                if !inputV2Negotiated {
+                    inputV2Negotiated = true
+                    var response = Data([WireMessage.inputV2Accepted, 2])
+                    var token = inputSessionToken.littleEndian
+                    withUnsafeBytes(of: &token) { response.append(contentsOf: $0) }
+                    connection.send(content: response, completion: .contentProcessed { _ in })
+                    debugLog("Input v2 negotiated")
+                }
+
+            case WireMessage.inputV2Frame:
+                guard inputBuffer.count >= 3 else { return }
+                let length = Int(inputByte(at: 1)) | (Int(inputByte(at: 2)) << 8)
+                guard inputV2Negotiated, [38, 51, 64].contains(length) else {
+                    finishInputConnection(connection, reason: "invalid input frame length")
+                    connection.cancel()
+                    return
+                }
+                guard inputBuffer.count >= 3 + length else { return }
+                let payload = Data(inputBuffer.dropFirst(3).prefix(length))
+                consumeInputBytes(3 + length)
+                guard let frame = TouchInputFrame.decode(payload), frame.sessionToken == inputSessionToken else {
+                    enqueueInput(.reset("invalid input frame"))
+                    continue
+                }
+                if let previous = lastInputSequence, frame.sequence <= previous { continue }
+                if let previous = lastInputTimestamp, frame.timestampMs < previous {
+                    enqueueInput(.reset("input clock moved backwards"))
+                    continue
+                }
+                lastInputSequence = frame.sequence
+                lastInputTimestamp = frame.timestampMs
+                if frame.phase == .cancel {
+                    resetInputDelivery(reason: "client cancelled input")
+                } else if touchEnabled {
+                    enqueueInput(.frame(frame))
                 }
 
             case WireMessage.ping:
@@ -922,8 +993,90 @@ class StreamingServer {
         let actionOffset = 2 + pointerCount * 8
         let action = data.withUnsafeBytes { $0.loadUnaligned(fromByteOffset: actionOffset, as: Int32.self) }
 
-        DispatchQueue.main.async {
-            self.onTouchEvent?(x1, y1, Int(action), pointerCount, x2, y2)
+        guard [x1, y1, x2, y2].allSatisfy({ $0.isFinite }), (0...3).contains(action) else {
+            enqueueInput(.reset("invalid legacy input"))
+            return
+        }
+        if action == 3 {
+            resetInputDelivery(reason: "legacy client cancelled input")
+        } else {
+            enqueueInput(.legacy(x1, y1, Int(action), pointerCount, x2, y2))
+        }
+    }
+
+    /// Invalidate queued input as well as work already dispatched to the main thread.
+    @discardableResult
+    private func resetInputDelivery(reason: String) -> UInt64 {
+        inputDeliveryLock.lock()
+        inputGeneration &+= 1
+        let generation = inputGeneration
+        pendingInput.removeAll(keepingCapacity: true)
+        pendingInput.append((generation, .reset(reason)))
+        scheduleInputDrainLocked()
+        inputDeliveryLock.unlock()
+        return generation
+    }
+
+    private func isCurrentInputGeneration(_ generation: UInt64) -> Bool {
+        inputDeliveryLock.lock()
+        defer { inputDeliveryLock.unlock() }
+        return generation == inputGeneration
+    }
+
+    func invalidateTouchInput(reason: String) {
+        resetInputDelivery(reason: reason)
+    }
+
+    private func finishInputConnection(_ conn: NWConnection, reason: String) {
+        guard connection === conn else { return }
+        isReceiving = false
+        connectionReady = false
+        inputBuffer.removeAll(keepingCapacity: true)
+        connection = nil
+        let generation = resetInputDelivery(reason: reason)
+        DispatchQueue.main.async { [weak self] in
+            guard let self, self.isCurrentInputGeneration(generation), !self.isStopped else { return }
+            self.onClientDisconnected?()
+        }
+    }
+
+    private func enqueueInput(_ event: InputDelivery) {
+        inputDeliveryLock.lock()
+        if let previous = pendingInput.last, previous.0 == inputGeneration, event.canReplace(previous.1) {
+            pendingInput[pendingInput.count - 1] = (inputGeneration, event)
+        } else if pendingInput.count < 512 {
+            pendingInput.append((inputGeneration, event))
+        } else {
+            pendingInput.removeAll(keepingCapacity: true)
+            pendingInput.append((inputGeneration, .reset("input backlog exceeded")))
+            connection?.cancel()
+        }
+        scheduleInputDrainLocked()
+        inputDeliveryLock.unlock()
+    }
+
+    private func scheduleInputDrainLocked() {
+        guard !inputDrainScheduled else { return }
+        inputDrainScheduled = true
+        DispatchQueue.main.async { [weak self] in self?.drainInput() }
+    }
+
+    private func drainInput() {
+        inputDeliveryLock.lock()
+        let events = Array(pendingInput.prefix(64))
+        pendingInput.removeFirst(events.count)
+        inputDrainScheduled = false
+        if !pendingInput.isEmpty { scheduleInputDrainLocked() }
+        inputDeliveryLock.unlock()
+        for (generation, event) in events {
+            guard isCurrentInputGeneration(generation) else { continue }
+            switch event {
+            case let .reset(reason): onInputReset?(reason)
+            case let .frame(frame):
+                if touchEnabled, !isStopped { onInputFrame?(frame) }
+            case let .legacy(x, y, action, count, x2, y2):
+                if touchEnabled, !isStopped { onTouchEvent?(x, y, action, count, x2, y2) }
+            }
         }
     }
 
@@ -1033,6 +1186,7 @@ class StreamingServer {
     func stop() {
         isStopped = true
         isReceiving = false
+        resetInputDelivery(reason: "server stopped")
 
         // Wait for pending operations before cancelling
         frameQueue.sync {}

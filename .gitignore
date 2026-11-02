@@ -20,6 +20,7 @@ AndroidClient/.idea/
 
 # macOS build (main + test apps)
 **/.build/
+**/.build-boox/
 **/.swiftpm/
 *.xcodeproj/xcuserdata/
 *.xcworkspace/xcuserdata/

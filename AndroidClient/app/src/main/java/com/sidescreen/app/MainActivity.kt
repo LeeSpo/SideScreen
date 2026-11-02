@@ -4,6 +4,7 @@ import android.annotation.SuppressLint
 import android.app.Dialog
 import android.content.Context
 import android.content.Intent
+import android.content.res.Configuration
 import android.content.IntentFilter
 import android.content.pm.ActivityInfo
 import android.graphics.Color
@@ -17,6 +18,7 @@ import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
 import android.os.PowerManager
+import android.os.SystemClock
 import android.provider.Settings
 import android.view.MotionEvent
 import android.view.Surface
@@ -85,8 +87,12 @@ class MainActivity : AppCompatActivity() {
     private var overlayDx = 0f
     private var overlayDy = 0f
 
-    // Input prediction for low-latency gaming
-    private val inputPredictor = InputPredictor()
+    // The Mac receives raw sampled coordinates; predicting positions can reverse a
+    // monotonically moving finger during deceleration.
+    private var activeTouchContacts: List<TouchInputContact> = emptyList()
+    private var touchViewportWidthDp = 1f
+    private var touchViewportHeightDp = 1f
+    private var suppressTouchUntilUp = false
 
     // Checklist status handler
     private val checklistHandler = Handler(Looper.getMainLooper())
@@ -338,6 +344,7 @@ class MainActivity : AppCompatActivity() {
                     width: Int,
                     height: Int,
                 ) {
+                    cancelTouch("surface size changed")
                     mainDiag("surfaceChanged: ${width}x$height")
                     log("Surface changed: ${width}x$height")
                     currentSurfaceHolder = holder
@@ -345,6 +352,7 @@ class MainActivity : AppCompatActivity() {
                 }
 
                 override fun surfaceDestroyed(holder: SurfaceHolder) {
+                    cancelTouch("surface destroyed")
                     mainDiag("surfaceDestroyed")
                     log("Surface destroyed")
                     if (!decoderUsingTextureView) {
@@ -373,11 +381,13 @@ class MainActivity : AppCompatActivity() {
                     width: Int,
                     height: Int,
                 ) {
+                    cancelTouch("texture size changed")
                     mainDiag("textureSizeChanged: ${width}x$height")
                     applyTextureTransform()
                 }
 
                 override fun onSurfaceTextureDestroyed(surface: SurfaceTexture): Boolean {
+                    cancelTouch("texture destroyed")
                     mainDiag("textureDestroyed")
                     if (decoderUsingTextureView) {
                         videoDecoder?.release()
@@ -482,6 +492,7 @@ class MainActivity : AppCompatActivity() {
         // Cancel any in-flight connection attempt (USB connect or wireless
         // auto-reconnect) so its callbacks can't feed real frames into the demo
         // decoder or flip the UI to "connected" mid-demo.
+        cancelTouch("demo started")
         streamClient?.disconnect()
         streamClient = null
         videoDecoder?.release()
@@ -690,6 +701,7 @@ class MainActivity : AppCompatActivity() {
 
     @SuppressLint("InflateParams", "SetTextI18n")
     private fun showSettingsDialog() {
+        cancelTouch("settings opened")
         val dialog = Dialog(this)
         dialog.requestWindowFeature(Window.FEATURE_NO_TITLE)
         dialog.setContentView(R.layout.dialog_settings)
@@ -1299,6 +1311,7 @@ class MainActivity : AppCompatActivity() {
                         )
                     }
                 } else {
+                    cancelTouch("connection ended")
                     stopPingTimer()
                     disableFullscreenMode()
                     resetOrientationToSensor()
@@ -1336,13 +1349,16 @@ class MainActivity : AppCompatActivity() {
             if (streamClient !== client) return@size
             mainDiag("onDisplaySize: ${width}x$height @ $rotation°, h=$flipHorizontal, v=$flipVertical")
             warnIfAvcOnlyWithoutNegotiation()
-            displayWidth = width
-            displayHeight = height
-            displayRotation = rotation
-            displayFlipHorizontal = flipHorizontal
-            displayFlipVertical = flipVertical
             runOnUiThread {
                 if (streamClient !== client) return@runOnUiThread
+                // Mapping and video geometry change together on the UI thread.
+                // A pending gesture must never straddle the two transforms.
+                cancelTouch("display configuration changed")
+                displayWidth = width
+                displayHeight = height
+                displayRotation = rotation
+                displayFlipHorizontal = flipHorizontal
+                displayFlipVertical = flipVertical
                 updateResolutionOverlay()
                 applyRotation(rotation, flipHorizontal, flipVertical)
                 initializeDecoderForCurrentSurface()
@@ -1542,6 +1558,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun disconnect() {
+        cancelTouch("disconnect")
         stopPingTimer()
         val oldClient = streamClient
         streamClient = null
@@ -1611,60 +1628,86 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    private fun handleTouch(
-        view: View,
-        event: MotionEvent,
-    ) {
-        val rawX = event.x / view.width.toFloat()
-        val rawY = event.y / view.height.toFloat()
-        val x = if (displayFlipHorizontal) 1f - rawX else rawX
-        val y = if (displayFlipVertical) 1f - rawY else rawY
-        val pointerCount = event.pointerCount.coerceAtMost(2)
-
-        var x2 = 0f
-        var y2 = 0f
-        if (pointerCount >= 2) {
-            val rawX2 = event.getX(1) / view.width.toFloat()
-            val rawY2 = event.getY(1) / view.height.toFloat()
-            x2 = if (displayFlipHorizontal) 1f - rawX2 else rawX2
-            y2 = if (displayFlipVertical) 1f - rawY2 else rawY2
+    private fun handleTouch(view: View, event: MotionEvent) {
+        if (!isConnected || !isForeground || !hasWindowFocus()) return
+        if (view.width <= 0 || view.height <= 0) {
+            cancelTouch("invalid viewport")
+            return
         }
-
         when (event.actionMasked) {
-            MotionEvent.ACTION_DOWN -> {
-                inputPredictor.reset()
-                inputPredictor.addSample(x, y)
-                streamClient?.sendTouch(x, y, 0, pointerCount, x2, y2)
-            }
-
-            MotionEvent.ACTION_POINTER_DOWN -> {
-                streamClient?.sendTouch(x, y, 0, pointerCount, x2, y2)
-            }
-
-            MotionEvent.ACTION_MOVE -> {
-                if (pointerCount == 1) {
-                    inputPredictor.addSample(x, y)
-                    val (px, py) = inputPredictor.predictPosition(12f)
-                    streamClient?.sendTouch(px, py, 1, 1)
-                } else {
-                    streamClient?.sendTouch(x, y, 1, pointerCount, x2, y2)
-                }
-            }
-
-            MotionEvent.ACTION_UP -> {
-                inputPredictor.reset()
-                streamClient?.sendTouch(x, y, 2, 1)
-            }
-
-            MotionEvent.ACTION_POINTER_UP -> {
-                streamClient?.sendTouch(x, y, 2, pointerCount, x2, y2)
-            }
-
-            MotionEvent.ACTION_CANCEL -> {
-                inputPredictor.reset()
-                streamClient?.sendTouch(x, y, 2, 1)
-            }
+            MotionEvent.ACTION_HOVER_ENTER, MotionEvent.ACTION_HOVER_MOVE,
+            MotionEvent.ACTION_HOVER_EXIT, MotionEvent.ACTION_SCROLL -> return
         }
+        val phase = when (event.actionMasked) {
+            MotionEvent.ACTION_DOWN -> TouchInputFrame.DOWN
+            MotionEvent.ACTION_MOVE -> TouchInputFrame.MOVE
+            MotionEvent.ACTION_UP -> TouchInputFrame.UP
+            MotionEvent.ACTION_POINTER_DOWN -> TouchInputFrame.POINTER_DOWN
+            MotionEvent.ACTION_POINTER_UP -> TouchInputFrame.POINTER_UP
+            MotionEvent.ACTION_CANCEL -> TouchInputFrame.CANCEL
+            else -> return
+        }
+        if (phase == TouchInputFrame.DOWN) {
+            if (activeTouchContacts.isNotEmpty()) cancelTouch("new gesture")
+            suppressTouchUntilUp = false
+        }
+        if (event.pointerCount > 2) {
+            cancelTouch("third contact")
+            suppressTouchUntilUp = true
+        }
+        if (suppressTouchUntilUp) {
+            if (phase == TouchInputFrame.UP || phase == TouchInputFrame.CANCEL) suppressTouchUntilUp = false
+            return
+        }
+        if (phase == TouchInputFrame.CANCEL) {
+            cancelTouch("system cancellation", event.eventTime)
+            return
+        }
+        // Ignore a MOVE or pointer transition left over from a cancelled gesture.
+        if (phase != TouchInputFrame.DOWN && activeTouchContacts.isEmpty()) return
+        val density = resources.displayMetrics.density.coerceAtLeast(0.1f)
+        touchViewportWidthDp = view.width / density
+        touchViewportHeightDp = view.height / density
+        val contacts = (0 until event.pointerCount).map { index ->
+            TouchInputContact(
+                event.getPointerId(index),
+                event.getX(index) / view.width.toFloat(),
+                event.getY(index) / view.height.toFloat(),
+                event.getToolType(index),
+            )
+        }.sortedBy { it.id }
+        if (contacts.any { !it.x.isFinite() || !it.y.isFinite() }) {
+            cancelTouch("invalid coordinate", event.eventTime)
+            return
+        }
+        val changedId = when (phase) {
+            TouchInputFrame.DOWN, TouchInputFrame.UP,
+            TouchInputFrame.POINTER_DOWN, TouchInputFrame.POINTER_UP -> event.getPointerId(event.actionIndex)
+            else -> -1
+        }
+        streamClient?.sendTouchFrame(
+            TouchInputFrame(event.eventTime, phase, changedId, touchViewportWidthDp, touchViewportHeightDp, contacts),
+            displayFlipHorizontal,
+            displayFlipVertical,
+        )
+        activeTouchContacts = when (phase) {
+            TouchInputFrame.UP -> emptyList()
+            TouchInputFrame.POINTER_UP -> contacts.filter { it.id != changedId }
+            else -> contacts
+        }
+    }
+
+    private fun cancelTouch(reason: String, eventTimeMs: Long = SystemClock.uptimeMillis()) {
+        if (isConnected || activeTouchContacts.isNotEmpty()) {
+            streamClient?.sendTouchFrame(
+                TouchInputFrame(eventTimeMs, TouchInputFrame.CANCEL, -1, touchViewportWidthDp, touchViewportHeightDp, emptyList()),
+                displayFlipHorizontal,
+                displayFlipVertical,
+            )
+            if (activeTouchContacts.isNotEmpty()) mainDiag("Touch cancelled: $reason")
+        }
+        activeTouchContacts = emptyList()
+        suppressTouchUntilUp = true
     }
 
     private fun applyRotation(
@@ -1732,9 +1775,20 @@ class MainActivity : AppCompatActivity() {
     }
 
     override fun onPause() {
+        cancelTouch("activity paused")
         isForeground = false
         stopChecklistUpdates()
         super.onPause()
+    }
+
+    override fun onWindowFocusChanged(hasFocus: Boolean) {
+        if (!hasFocus) cancelTouch("window lost focus")
+        super.onWindowFocusChanged(hasFocus)
+    }
+
+    override fun onConfigurationChanged(newConfig: Configuration) {
+        cancelTouch("orientation changed")
+        super.onConfigurationChanged(newConfig)
     }
 
     override fun onNewIntent(intent: Intent) {
