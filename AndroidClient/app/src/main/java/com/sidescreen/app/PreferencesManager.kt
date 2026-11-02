@@ -8,6 +8,10 @@ class PreferencesManager(
 ) {
     private val prefs: SharedPreferences = context.getSharedPreferences("app_prefs", Context.MODE_PRIVATE)
 
+    var decoderProfile: String
+        get() = prefs.getString("boox_decoder_profile", BooxDecoderProfile.QCOM_ORDER.id)!!
+        set(value) = prefs.edit().putString("boox_decoder_profile", BooxDecoderProfile.fromId(value).id).apply()
+
     var showStatsOverlay: Boolean
         get() = prefs.getBoolean("show_stats", true)
         set(value) = prefs.edit().putBoolean("show_stats", value).apply()

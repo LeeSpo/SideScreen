@@ -13,7 +13,7 @@
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
         android:text="Display Settings"
-        android:textColor="#FFFFFF"
+        android:textColor="#161616"
         android:textSize="24sp"
         android:textStyle="bold"
         android:layout_marginBottom="24dp" />
@@ -35,14 +35,14 @@
                 android:layout_width="wrap_content"
                 android:layout_height="wrap_content"
                 android:text="Show Stats Overlay"
-                android:textColor="#FFFFFF"
+                android:textColor="#161616"
                 android:textSize="16sp"
                 android:textStyle="bold" />
             <TextView
                 android:layout_width="wrap_content"
                 android:layout_height="wrap_content"
                 android:text="Display FPS, bitrate, and resolution"
-                android:textColor="#AAAAAA"
+                android:textColor="#444444"
                 android:textSize="12sp" />
         </LinearLayout>
 
@@ -51,8 +51,8 @@
             android:layout_width="wrap_content"
             android:layout_height="wrap_content"
             android:checked="true"
-            app:thumbTint="#FFFFFF"
-            app:trackTint="#4CAF50" />
+            app:thumbTint="#161616"
+            app:trackTint="#1B5E20" />
     </LinearLayout>
 
     <!-- Opacity Slider -->
@@ -60,7 +60,7 @@
         android:layout_width="wrap_content"
         android:layout_height="wrap_content"
         android:text="Overlay Opacity"
-        android:textColor="#FFFFFF"
+        android:textColor="#161616"
         android:textSize="16sp"
         android:textStyle="bold"
         android:layout_marginBottom="8dp" />
@@ -76,7 +76,7 @@
             android:layout_width="wrap_content"
             android:layout_height="wrap_content"
             android:text="20%"
-            android:textColor="#AAAAAA"
+            android:textColor="#444444"
             android:textSize="12sp"
             android:layout_marginEnd="12dp" />
 
@@ -89,15 +89,15 @@
             android:valueTo="1.0"
             android:value="0.8"
             android:stepSize="0.1"
-            app:thumbColor="#FFFFFF"
-            app:trackColorActive="#4CAF50"
-            app:trackColorInactive="#33FFFFFF" />
+            app:thumbColor="#161616"
+            app:trackColorActive="#1B5E20"
+            app:trackColorInactive="#66000000" />
 
         <TextView
             android:layout_width="wrap_content"
             android:layout_height="wrap_content"
             android:text="100%"
-            android:textColor="#AAAAAA"
+            android:textColor="#444444"
             android:textSize="12sp"
             android:layout_marginStart="12dp" />
     </LinearLayout>
@@ -109,14 +109,15 @@
         android:layout_width="match_parent"
         android:layout_height="48dp"
         android:text="Reset Overlay Position"
-        android:textColor="#FFFFFF"
-        app:strokeColor="#FFFFFF"
+        android:textColor="#161616"
+        app:strokeColor="#161616"
         app:strokeWidth="1dp"
         app:cornerRadius="12dp"
         android:layout_marginBottom="16dp" />
 
     <!-- Close Button -->
     <com.google.android.material.button.MaterialButton
+                android:textColor="#FFFFFF"
         android:id="@+id/closeButton"
         android:layout_width="match_parent"
         android:layout_height="56dp"
@@ -124,6 +125,7 @@
         android:textSize="16sp"
         android:textStyle="bold"
         app:cornerRadius="14dp"
-        app:backgroundTint="#4CAF50" />
+        android:backgroundTint="#303030"
+                app:backgroundTint="#303030" />
 
 </LinearLayout>

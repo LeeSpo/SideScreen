@@ -40,6 +40,8 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import kotlinx.coroutines.CancellationException
 import java.net.InetSocketAddress
 import java.net.Socket
 
@@ -89,7 +91,15 @@ class MainActivity : AppCompatActivity() {
     // Checklist status handler
     private val checklistHandler = Handler(Looper.getMainLooper())
     private var checklistRunnable: Runnable? = null
-    private var isConnected = false // Track connection state to prevent checklist conflicts
+    @Volatile private var isConnected = false
+    @Volatile private var isConnecting = false
+    @Volatile private var isForeground = false
+    private var connectionJob: Job? = null
+    private var checklistJob: Job? = null
+    private val probeLock = Any()
+    private var probeSocket: Socket? = null
+    private var recoveryWindowNs = 0L
+    private var recoveryAttempts = 0
 
     // Demo mode: plays a bundled clip so the app can be tried without a Mac
     private var demoPlayer: DemoPlayer? = null
@@ -137,6 +147,7 @@ class MainActivity : AppCompatActivity() {
         startChecklistUpdates()
         setupModeToggle()
         setupWirelessController()
+        handleRepairIntent(intent)
     }
 
     private fun setupModeToggle() {
@@ -1150,12 +1161,33 @@ class MainActivity : AppCompatActivity() {
                 } else {
                     MediaFormat.MIMETYPE_VIDEO_HEVC
                 }
-            videoDecoder = VideoDecoder(surface, displayObj, displayWidth, displayHeight, mime)
+            videoDecoder = VideoDecoder(surface, displayObj, displayWidth, displayHeight, mime,
+                BooxDecoderProfile.fromId(prefs.decoderProfile))
+            val decoderClient = streamClient
             videoDecoder?.onFrameDecoded = { buffer ->
-                streamClient?.releaseBuffer(buffer)
+                decoderClient?.releaseBuffer(buffer)
             }
             videoDecoder?.onKeyframeRequired = { force, reason ->
-                streamClient?.requestKeyframe(force = force, reason = reason)
+                if (streamClient === decoderClient) decoderClient?.requestKeyframe(force = force, reason = reason)
+            }
+            videoDecoder?.onRecoveryRequired = {
+                runOnUiThread {
+                    val now = System.nanoTime()
+                    if (now - recoveryWindowNs > 30_000_000_000L) {
+                        recoveryWindowNs = now
+                        recoveryAttempts = 0
+                    }
+                    if (isConnected && recoveryAttempts < 3) {
+                        recoveryAttempts++
+                        mainDiag("BOOX decoder recovery $recoveryAttempts: rebuilding and waiting for IDR")
+                        videoDecoder?.release()
+                        videoDecoder = null
+                        initializeDecoderForCurrentSurface()
+                        streamClient?.requestKeyframe(force = true, reason = "BOOX decoder recovery")
+                    } else {
+                        mainDiag("BOOX recovery limit reached; low-latency profile did not pass")
+                    }
+                }
             }
             videoDecoder?.onDecoderStalled = {
                 // Black screen with live stats: tell the user why instead of
@@ -1212,12 +1244,13 @@ class MainActivity : AppCompatActivity() {
      * Wire up all StreamClient callbacks. Used by both USB connect() and wireless connectWireless().
      */
     private fun setupStreamClientCallbacks() {
-        streamClient?.onFrameReceived = { frameData, frameSize, timestamp, isKeyframe ->
+        val client = streamClient ?: return
+        client.onFrameReceived = { frameData, frameSize, timestamp, isKeyframe ->
             val dec = videoDecoder
-            if (dec != null) {
+            if (streamClient === client && dec != null) {
                 dec.decode(frameData, frameSize, timestamp, isKeyframe)
             } else {
-                mainDiag("FRAME DROPPED: videoDecoder is null!")
+                client.releaseBuffer(frameData)
             }
         }
 
@@ -1233,14 +1266,15 @@ class MainActivity : AppCompatActivity() {
 
         streamClient?.onConnectionStatus = { connected ->
             runOnUiThread {
+                if (streamClient !== client) return@runOnUiThread
                 isConnected = connected
-                reviewPrompter.onConnectionChanged(connected)
+                isConnecting = false
                 if (connected) {
                     updateStatus("Connected - Streaming active")
                 } else {
                     updateStatus("Disconnected")
                 }
-                binding.connectButton.isEnabled = !connected
+                binding.connectButton.isEnabled = !connected && !isConnecting
                 binding.disconnectButton.isEnabled = connected
                 binding.statusIndicator.setBackgroundResource(
                     if (connected) android.R.color.holo_green_light else android.R.color.holo_red_light,
@@ -1289,15 +1323,17 @@ class MainActivity : AppCompatActivity() {
             }
         }
 
-        streamClient?.onDesktopSize = { w, h ->
+        streamClient?.onDesktopSize = desktop@{ w, h ->
+            if (streamClient !== client) return@desktop
             desktopWidth = w
             desktopHeight = h
             runOnUiThread { updateResolutionOverlay() }
         }
 
-        streamClient?.onCodecSelected = { isHevc -> onStreamCodecSelected(isHevc) }
+        streamClient?.onCodecSelected = { isHevc -> if (streamClient === client) onStreamCodecSelected(isHevc) }
 
-        streamClient?.onDisplaySize = { width, height, rotation, flipHorizontal, flipVertical ->
+        streamClient?.onDisplaySize = size@{ width, height, rotation, flipHorizontal, flipVertical ->
+            if (streamClient !== client) return@size
             mainDiag("onDisplaySize: ${width}x$height @ $rotation°, h=$flipHorizontal, v=$flipVertical")
             warnIfAvcOnlyWithoutNegotiation()
             displayWidth = width
@@ -1306,6 +1342,7 @@ class MainActivity : AppCompatActivity() {
             displayFlipHorizontal = flipHorizontal
             displayFlipVertical = flipVertical
             runOnUiThread {
+                if (streamClient !== client) return@runOnUiThread
                 updateResolutionOverlay()
                 applyRotation(rotation, flipHorizontal, flipVertical)
                 initializeDecoderForCurrentSurface()
@@ -1464,175 +1501,73 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    private fun connect(
-        host: String,
-        port: Int,
-    ) {
+    private fun connect(host: String, port: Int) {
+        if (isConnected || isConnecting || connectionJob?.isActive == true) return
+        if (port !in 1..65535) {
+            showError("Port must be between 1 and 65535")
+            return
+        }
         stopDemo()
-        lifecycleScope.launch(Dispatchers.IO) {
+        isConnecting = true
+        stopChecklistUpdates()
+        videoDecoder?.release()
+        videoDecoder = null
+        displayWidth = 0
+        displayHeight = 0
+        desktopWidth = 0
+        desktopHeight = 0
+        binding.connectButton.isEnabled = false
+        val client = StreamClient(host, port, applicationContext)
+        streamClient = client
+        setupStreamClientCallbacks()
+        connectionJob = lifecycleScope.launch(Dispatchers.IO) {
             try {
-                log("Connecting to $host:$port...")
-
-                streamClient = StreamClient(host, port, applicationContext)
-                streamClient?.onFrameReceived = { frameData, frameSize, timestamp, isKeyframe ->
-                    val dec = videoDecoder
-                    if (dec != null) {
-                        dec.decode(frameData, frameSize, timestamp, isKeyframe)
-                    } else {
-                        streamClient?.releaseBuffer(frameData)
-                    }
-                }
-
-                // Wire up buffer release callback for buffer pooling
-                // When decode completes, buffer is returned to StreamClient's pool
-                videoDecoder?.onFrameDecoded = { buffer ->
-                    streamClient?.releaseBuffer(buffer)
-                }
-                videoDecoder?.onKeyframeRequired = { force, reason ->
-                    streamClient?.requestKeyframe(force = force, reason = reason)
-                }
-
-                // Latency measurement via ping/pong
-                streamClient?.onLatencyMeasured = { rttMs ->
-                    runOnUiThread {
-                        binding.latencyText.text = String.format("%.1f ms", rttMs)
-                    }
-                }
-
-                streamClient?.onConnectionStatus = { connected ->
-                    runOnUiThread {
-                        // Update connection state flag
-                        isConnected = connected
-                        reviewPrompter.onConnectionChanged(connected)
-
-                        if (connected) {
-                            updateStatus("Connected - Streaming active")
-                        } else {
-                            updateStatus("Disconnected")
-                        }
-
-                        binding.connectButton.isEnabled = !connected
-                        binding.disconnectButton.isEnabled = connected
-
-                        // Update status indicator color
-                        binding.statusIndicator.setBackgroundResource(
-                            if (connected) {
-                                android.R.color.holo_green_light
-                            } else {
-                                android.R.color.holo_red_light
-                            },
-                        )
-
-                        if (connected) {
-                            // Start periodic ping for latency measurement
-                            startPingTimer()
-
-                            // Stop checklist updates when connected (prevents socket conflicts)
-                            stopChecklistUpdates()
-
-                            // Enter fullscreen mode when connected
-                            enableFullscreenMode()
-
-                            binding.settingsPanel.visibility = View.GONE
-                            applySettingsButtonVisibility()
-                            restoreSettingsButtonPosition()
-                            updateOverlayVisibility(prefs.showStatsOverlay)
-                        } else {
-                            // Stop ping timer
-                            stopPingTimer()
-
-                            // Exit fullscreen mode when disconnected
-                            disableFullscreenMode()
-
-                            // Reset to follow device sensor when disconnected
-                            resetOrientationToSensor()
-
-                            binding.settingsPanel.visibility = View.VISIBLE
-                            binding.settingsButton.visibility = View.GONE
-                            binding.statusBar.visibility = View.GONE
-
-                            // Restart checklist updates immediately
-                            log("📋 Restarting checklist updates")
-                            startChecklistUpdates()
-                        }
-                    }
-                }
-
-                streamClient?.onCodecSelected = { isHevc -> onStreamCodecSelected(isHevc) }
-
-                streamClient?.onDesktopSize = { w, h ->
-                    desktopWidth = w
-                    desktopHeight = h
-                    runOnUiThread { updateResolutionOverlay() }
-                }
-
-                streamClient?.onDisplaySize = { width, height, rotation, flipHorizontal, flipVertical ->
-                    mainDiag("onDisplaySize: ${width}x$height @ $rotation°, h=$flipHorizontal, v=$flipVertical")
-                    warnIfAvcOnlyWithoutNegotiation()
-                    displayWidth = width
-                    displayHeight = height
-                    displayRotation = rotation
-                    displayFlipHorizontal = flipHorizontal
-                    displayFlipVertical = flipVertical
-
-                    runOnUiThread {
-                        updateResolutionOverlay()
-                        applyRotation(rotation, flipHorizontal, flipVertical)
-                        initializeDecoderForCurrentSurface()
-                    }
-                    log("Display: ${width}x$height @ $rotation°")
-                }
-
-                streamClient?.onStats = { fps, mbps ->
-                    runOnUiThread {
-                        binding.fpsText.text = String.format("%.1f", fps)
-                        binding.bitrateText.text = String.format("%.1f Mbps", mbps)
-                    }
-                }
-
-                streamClient?.connect()
+                log("Connecting to $host:$port (${prefs.decoderProfile})...")
+                client.connect()
+            } catch (e: CancellationException) {
+                throw e
             } catch (e: Exception) {
-                val errorMessage =
-                    when {
-                        e.message?.contains("ECONNREFUSED") == true -> {
-                            "Mac server is not running.\n\nPlease start Side Screen.app on your Mac first."
-                        }
-
-                        e.message?.contains("Network is unreachable") == true -> {
-                            "Cannot reach Mac.\n\n" +
-                                "Make sure both devices are connected via USB cable and ADB reverse is configured."
-                        }
-
-                        e.message?.contains("timeout") == true -> {
-                            "Connection timeout.\n\nCheck if Mac firewall is blocking port $port."
-                        }
-
-                        else -> {
-                            "Connection failed: ${e.message}\n\n" +
-                                "Try:\n• Start Side Screen.app on Mac\n" +
-                                "• Check USB connection\n• Run: adb reverse tcp:$port tcp:$port"
-                        }
+                log("Connection failed: ${e.message}")
+            } finally {
+                withContext(kotlinx.coroutines.NonCancellable + Dispatchers.Main) {
+                    if (streamClient === client) {
+                        isConnecting = false
+                        isConnected = false
+                        binding.connectButton.isEnabled = true
+                        startChecklistUpdates()
                     }
-                updateStatus("Connection failed")
-                showError(errorMessage)
+                }
             }
         }
     }
 
     private fun disconnect() {
         stopPingTimer()
-        streamClient?.disconnect()
-        // Reset display config so next connect defers decoder init until config arrives
+        val oldClient = streamClient
+        streamClient = null
+        isConnecting = false
+        isConnected = false
+        connectionJob?.cancel()
+        connectionJob = null
+        // Close even during onDestroy, after lifecycleScope has been cancelled.
+        oldClient?.disconnect()
+        videoDecoder?.release()
+        videoDecoder = null
         displayWidth = 0
         displayHeight = 0
         desktopWidth = 0
         desktopHeight = 0
         displayFlipHorizontal = false
         displayFlipVertical = false
-        runOnUiThread {
-            binding.textureView.visibility = View.GONE
-            applyTextureTransform()
-        }
+        binding.textureView.visibility = View.GONE
+        applyTextureTransform()
+        binding.settingsPanel.visibility = View.VISIBLE
+        binding.settingsButton.visibility = View.GONE
+        binding.statusBar.visibility = View.GONE
+        binding.connectButton.isEnabled = true
+        updateStatus("Disconnected")
+        resetOrientationToSensor()
+        startChecklistUpdates()
         log("Disconnected")
     }
 
@@ -1791,8 +1726,36 @@ class MainActivity : AppCompatActivity() {
 
     override fun onResume() {
         super.onResume()
-        // Only nudge about updates while idle — never over a live stream or the demo.
-        if (!isStreamingUi) appUpdater.checkForUpdate()
+        isForeground = true
+        startChecklistUpdates()
+        // This independently signed fork must never install an official APK over itself.
+    }
+
+    override fun onPause() {
+        isForeground = false
+        stopChecklistUpdates()
+        super.onPause()
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        handleRepairIntent(intent)
+    }
+
+    /** ADB development interface for reproducible, same-content profile benchmarks. */
+    private fun handleRepairIntent(command: Intent) {
+        if (!BuildConfig.DEBUG) return
+        command.getStringExtra("boox_profile")?.let { prefs.decoderProfile = it }
+        if (command.getBooleanExtra("boox_dump_metrics", false)) videoDecoder?.dumpMetrics()
+        if (command.getBooleanExtra("boox_disconnect", false)) disconnect()
+        if (command.getBooleanExtra("boox_connect", false)) {
+            if (command.getBooleanExtra("boox_reconnect", false)) disconnect()
+            binding.root.post {
+                connect(command.getStringExtra("boox_host") ?: "127.0.0.1",
+                    command.getIntExtra("boox_port", 54321))
+            }
+        }
     }
 
     override fun onDestroy() {
@@ -1804,6 +1767,7 @@ class MainActivity : AppCompatActivity() {
     // ==================== Connection Checklist ====================
 
     private fun startChecklistUpdates() {
+        if (!canRunChecklist()) return
         // Stop any existing runnable first to prevent duplicates
         checklistRunnable?.let {
             checklistHandler.removeCallbacks(it)
@@ -1812,6 +1776,7 @@ class MainActivity : AppCompatActivity() {
         checklistRunnable =
             object : Runnable {
                 override fun run() {
+                    if (!canRunChecklist()) return
                     updateChecklist()
                     checklistHandler.postDelayed(this, 2000) // Update every 2 seconds
                 }
@@ -1824,15 +1789,24 @@ class MainActivity : AppCompatActivity() {
             checklistHandler.removeCallbacks(it)
             checklistRunnable = null
         }
+        checklistJob?.cancel()
+        checklistJob = null
+        synchronized(probeLock) {
+            try { probeSocket?.close() } catch (_: Exception) { }
+            probeSocket = null
+        }
     }
+
+    private fun canRunChecklist(): Boolean = isForeground && !isConnected && !isConnecting &&
+        !demoActive && prefs.connectionMode == ConnectionMode.USB && !isFinishing && !isDestroyed
 
     private fun updateChecklist() {
         // Skip if connected (to prevent socket conflicts)
-        if (isConnected) return
+        if (!canRunChecklist()) return
 
         // Check Developer Mode (if we can run this app with USB debugging, dev mode is enabled)
         val isDeveloperModeEnabled =
-            Settings.Secure.getInt(
+            Settings.Global.getInt(
                 contentResolver,
                 Settings.Global.DEVELOPMENT_SETTINGS_ENABLED,
                 0,
@@ -1841,12 +1815,14 @@ class MainActivity : AppCompatActivity() {
 
         // Check USB Debugging (ADB enabled)
         val isAdbEnabled =
-            Settings.Secure.getInt(
+            Settings.Global.getInt(
                 contentResolver,
                 Settings.Global.ADB_ENABLED,
                 0,
             ) == 1
         updateChecklistItem(binding.checkUsbDebugging, isAdbEnabled)
+        // BOOX can omit development_settings_enabled even while ADB is enabled.
+        updateChecklistItem(binding.checkDeveloperMode, isDeveloperModeEnabled || isAdbEnabled)
 
         // Check USB connected (check if any USB device is connected)
         val usbManager = getSystemService(Context.USB_SERVICE) as UsbManager
@@ -1854,23 +1830,20 @@ class MainActivity : AppCompatActivity() {
         updateChecklistItem(binding.checkUsbConnected, isUsbConnected)
 
         // Check Mac Server (try to connect to port)
-        lifecycleScope.launch(Dispatchers.IO) {
+        if (checklistJob?.isActive == true) return
+        val port = binding.portInput.text.toString().toIntOrNull() ?: 54321
+        checklistJob = lifecycleScope.launch(Dispatchers.IO) {
             // Double-check connection state before socket test
-            if (isConnected) return@launch
-
-            val port =
-                binding.portInput.text
-                    .toString()
-                    .toIntOrNull() ?: 54321
+            if (!canRunChecklist()) return@launch
             val isServerRunning = checkServerRunning("127.0.0.1", port)
             runOnUiThread {
                 // Final check before updating UI
-                if (isConnected) return@runOnUiThread
+                if (!canRunChecklist()) return@runOnUiThread
 
                 updateChecklistItem(binding.checkMacServer, isServerRunning)
 
                 // Update main status indicator based on all checklist items
-                val allReady = isDeveloperModeEnabled && isAdbEnabled && isUsbConnected && isServerRunning
+                val allReady = isAdbEnabled && isUsbConnected && isServerRunning
                 updateMainStatus(allReady)
             }
         }
@@ -1924,7 +1897,10 @@ class MainActivity : AppCompatActivity() {
     ): Boolean {
         var socket: Socket? = null
         return try {
-            socket = Socket()
+            socket = synchronized(probeLock) {
+                if (!canRunChecklist()) return false
+                Socket().also { probeSocket = it }
+            }
             socket.connect(InetSocketAddress(host, port), 300) // 300ms connect timeout
             socket.soTimeout = 200 // 200ms read timeout
 
@@ -1945,6 +1921,7 @@ class MainActivity : AppCompatActivity() {
             } catch (e: Exception) {
                 // ignore
             }
+            synchronized(probeLock) { if (probeSocket === socket) probeSocket = null }
         }
     }
 }

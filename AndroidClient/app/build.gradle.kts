@@ -12,11 +12,11 @@ android {
     compileSdk = 36
 
     defaultConfig {
-        applicationId = "com.sidescreen.app"
+        applicationId = "com.sidescreen.app.booxfix"
         minSdk = 26
         targetSdk = 36
         versionCode = computedVersionCode
-        versionName = appVersion
+        versionName = "$appVersion-booxfix.3-light"
     }
 
     // Release signing: reads the upload key from env vars (set as GitHub Secrets in CI,
@@ -40,8 +40,7 @@ android {
         // Separate package so a debug build installs next to the Play Store build
         // (different signing keys would otherwise force an uninstall).
         debug {
-            applicationIdSuffix = ".debug"
-            versionNameSuffix = "-debug"
+            // Stable, separate identity: never replaces the official APK.
         }
         release {
             // R8: shrink + obfuscate. Play flags bundles with <25% obfuscated code
@@ -69,6 +68,7 @@ android {
 
     buildFeatures {
         viewBinding = true
+        buildConfig = true
     }
 }
 

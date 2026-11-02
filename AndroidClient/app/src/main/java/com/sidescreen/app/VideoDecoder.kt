@@ -3,6 +3,8 @@ package com.sidescreen.app
 import android.media.MediaCodec
 import android.media.MediaCodecList
 import android.media.MediaFormat
+import android.media.MediaCodecInfo
+import android.os.Build
 import android.os.Handler
 import android.os.HandlerThread
 import android.os.Process
@@ -21,6 +23,7 @@ class VideoDecoder(
     // Exposed so MainActivity can detect a codec-negotiation/decoder mismatch
     // and recreate the decoder (see MainActivity.onStreamCodecSelected).
     val mime: String = MediaFormat.MIMETYPE_VIDEO_HEVC,
+    val profile: BooxDecoderProfile = BooxDecoderProfile.QCOM_ORDER,
 ) {
     private var decoder: MediaCodec? = null
     private var decoderThread: HandlerThread? = null
@@ -32,6 +35,11 @@ class VideoDecoder(
     private var lastStatsTime = System.currentTimeMillis()
     private var inputFrameCount = 0L
     private var outputFrameCount = 0L
+    @Volatile private var generation = 0L
+    private var metrics = DecoderMetrics(profile.id)
+    private var consecutiveStale = 0
+    private var recoveryRequested = false
+    var onRecoveryRequired: (() -> Unit)? = null
 
     // Decoder pipeline latency (input enqueue -> output buffer available),
     // accumulated over ~60 frames then logged. High values indicate the codec
@@ -74,7 +82,7 @@ class VideoDecoder(
         setupDecoder()
     }
 
-    fun updateResolution(
+    @Synchronized fun updateResolution(
         width: Int,
         height: Int,
     ) {
@@ -88,6 +96,13 @@ class VideoDecoder(
     }
 
     private fun setupDecoder() {
+        val currentGeneration = ++generation
+        metrics = DecoderMetrics("${profile.id}-${currentWidth}x$currentHeight-${System.nanoTime()}-$currentGeneration")
+        inputFrameCount = 0L
+        outputFrameCount = 0L
+        queuedInputCount = 0L
+        consecutiveStale = 0
+        recoveryRequested = false
         decoderThread = HandlerThread("DecoderThread", Process.THREAD_PRIORITY_DISPLAY).also { it.start() }
         decoderHandler = Handler(decoderThread!!.looper)
 
@@ -108,7 +123,7 @@ class VideoDecoder(
                     codec: MediaCodec,
                     index: Int,
                 ) {
-                    availableInputBuffers.offer(index)
+                    if (generation == currentGeneration) availableInputBuffers.offer(index)
                 }
 
                 override fun onOutputBufferAvailable(
@@ -116,13 +131,14 @@ class VideoDecoder(
                     index: Int,
                     info: MediaCodec.BufferInfo,
                 ) {
-                    handleOutputBuffer(codec, index, info)
+                    if (generation == currentGeneration) handleOutputBuffer(codec, index, info)
                 }
 
                 override fun onError(
                     codec: MediaCodec,
                     e: MediaCodec.CodecException,
                 ) {
+                    if (generation != currentGeneration) return
                     diagLog("Codec error: ${e.diagnosticInfo}")
                     Log.e(TAG, "Codec error: ${e.diagnosticInfo}", e)
                     needsKeyframe = true
@@ -138,6 +154,7 @@ class VideoDecoder(
             }
         codec.setCallback(callback, decoderHandler)
 
+
         val format =
             MediaFormat.createVideoFormat(
                 mime,
@@ -147,19 +164,53 @@ class VideoDecoder(
 
         var configured = false
 
+        val codecName = codec.name.lowercase()
+        val qcom = codecName.startsWith("omx.qcom.") || codecName.startsWith("c2.qti.")
+        val standardLowLatency = try {
+            Build.VERSION.SDK_INT >= 30 && codec.codecInfo.getCapabilitiesForType(mime)
+                .isFeatureSupported(MediaCodecInfo.CodecCapabilities.FEATURE_LowLatency)
+        } catch (_: Exception) { false }
+        val vendorParameters = try {
+            if (Build.VERSION.SDK_INT >= 31) codec.supportedVendorParameters.joinToString() else "unavailable"
+        } catch (_: Exception) { "unavailable" }
+        diagLog("BOOX profile=${profile.id}, standardLowLatency=$standardLowLatency, vendorParameters=[$vendorParameters]")
+
         // Attempt 1: Full low-latency config
         try {
-            format.setInteger(MediaFormat.KEY_LOW_LATENCY, 1)
+            if (standardLowLatency || profile == BooxDecoderProfile.COMPATIBLE) {
+                format.setInteger(MediaFormat.KEY_LOW_LATENCY, 1)
+            }
             format.setInteger(MediaFormat.KEY_PRIORITY, 0)
             format.setInteger(MediaFormat.KEY_OPERATING_RATE, displayRefreshRate.toInt())
-            format.setInteger(MediaFormat.KEY_MAX_B_FRAMES, 0)
+            if (qcom && profile in listOf(BooxDecoderProfile.QCOM_ORDER, BooxDecoderProfile.QCOM_LOW_LATENCY)) {
+                format.setInteger("vendor.qti-ext-dec-low-latency.enable", 1)
+                if (profile == BooxDecoderProfile.QCOM_ORDER) {
+                    format.setInteger("vendor.qti-ext-dec-picture-order.enable", 1)
+                }
+            }
             codec.configure(format, surface, null, 0)
             configured = true
-            diagLog("Configured with full low-latency")
+            diagLog("BOOX configured ${profile.id}: $format")
         } catch (e: Exception) {
             diagLog("Full low-latency config failed: ${e.message}")
             codec.reset()
             codec.setCallback(callback, decoderHandler)
+        }
+
+        // Some Qualcomm implementations reject picture-order while accepting low-latency.
+        if (!configured && qcom && profile == BooxDecoderProfile.QCOM_ORDER) {
+            try {
+                val vendorOnly = MediaFormat.createVideoFormat(mime, currentWidth, currentHeight)
+                vendorOnly.setInteger("vendor.qti-ext-dec-low-latency.enable", 1)
+                vendorOnly.setInteger(MediaFormat.KEY_PRIORITY, 0)
+                codec.configure(vendorOnly, surface, null, 0)
+                configured = true
+                diagLog("BOOX configured qcom-low-latency fallback: $vendorOnly")
+            } catch (e: Exception) {
+                diagLog("BOOX vendor-only configure failed: ${e.message}")
+                codec.reset()
+                codec.setCallback(callback, decoderHandler)
+            }
         }
 
         // Attempt 2: Without KEY_LOW_LATENCY
@@ -172,6 +223,7 @@ class VideoDecoder(
                         currentHeight,
                     )
                 basicFormat.setInteger(MediaFormat.KEY_PRIORITY, 0)
+                if (standardLowLatency) basicFormat.setInteger(MediaFormat.KEY_LOW_LATENCY, 1)
                 basicFormat.setInteger(MediaFormat.KEY_MAX_B_FRAMES, 0)
                 codec.configure(basicFormat, surface, null, 0)
                 configured = true
@@ -204,6 +256,13 @@ class VideoDecoder(
                 throw e
             }
         }
+
+        codec.setOnFrameRenderedListener({ _, ptsUs, renderedNs ->
+            if (generation == currentGeneration) {
+                metrics.presented(ptsUs, renderedNs)
+                trackFrameTiming(renderedNs)
+            }
+        }, decoderHandler)
 
         codec.setVideoScalingMode(MediaCodec.VIDEO_SCALING_MODE_SCALE_TO_FIT)
         needsKeyframe = true
@@ -306,7 +365,7 @@ class VideoDecoder(
         return null
     }
 
-    fun decode(
+    @Synchronized fun decode(
         frameData: ByteArray,
         frameSize: Int = frameData.size,
         frameTimestamp: Long = System.nanoTime(),
@@ -319,6 +378,7 @@ class VideoDecoder(
         }
 
         inputFrameCount++
+        metrics.received()
         if (inputFrameCount == 1L) {
             val header =
                 frameData
@@ -343,6 +403,7 @@ class VideoDecoder(
             }
 
         if (needsKeyframe && !isKeyframe) {
+            metrics.droppedForKeyframe()
             dropFrame(
                 frameData,
                 isKeyframe,
@@ -363,6 +424,8 @@ class VideoDecoder(
             // which feels better than a 1-2 s freeze waiting on the next
             // throttled request to land.
             droppedFrames++
+            metrics.droppedForInput()
+            needsKeyframe = true
             if (droppedFrames <= 3L || droppedFrames % 60L == 0L) {
                 diagLog("Dropping frame (no input buffer, dropped=$droppedFrames)")
             }
@@ -388,6 +451,7 @@ class VideoDecoder(
                     ?: throw IllegalStateException("Input buffer $index is null")
             inputBuffer.clear()
             inputBuffer.put(frameData, 0, frameSize)
+            metrics.queued(frameTimestamp / 1000, frameTimestamp, System.nanoTime())
             codec.queueInputBuffer(index, 0, frameSize, frameTimestamp / 1000, 0)
             queuedInputCount++
             if (queuedInputCount == STALL_DETECT_INPUT_FRAMES && outputFrameCount == 0L && !stallReported) {
@@ -485,6 +549,8 @@ class VideoDecoder(
                     latencyNs <= MAX_RENDER_LATENCY_NS
 
             if (!shouldRender) {
+                metrics.output(info.presentationTimeUs, nowNs, false)
+                consecutiveStale++
                 droppedFrames++
                 staleOutputDrops++
                 if (staleOutputDrops <= 3L || staleOutputDrops % 60L == 0L) {
@@ -495,11 +561,18 @@ class VideoDecoder(
                 }
                 codec.releaseOutputBuffer(index, false)
                 updateStats()
+                if (consecutiveStale >= 3 && !recoveryRequested && profile != BooxDecoderProfile.COMPATIBLE) {
+                    recoveryRequested = true
+                    needsKeyframe = true
+                    diagLog("BOOX recovery requested: consecutive stale output=$consecutiveStale")
+                    onRecoveryRequired?.invoke()
+                }
                 return
             }
 
+            consecutiveStale = 0
+            metrics.output(info.presentationTimeUs, nowNs, true)
             codec.releaseOutputBuffer(index, true)
-            trackFrameTiming(System.nanoTime())
             updateStats()
         } catch (e: Exception) {
             Log.e(TAG, "releaseOutputBuffer failed", e)
@@ -538,8 +611,12 @@ class VideoDecoder(
         }
     }
 
-    fun release() {
+    fun dumpMetrics() = metrics.log()
+
+    @Synchronized fun release() {
         isRunning = false
+        generation++
+        metrics.log()
         try {
             availableInputBuffers.clear()
             decoder?.stop()

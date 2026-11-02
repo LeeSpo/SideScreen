@@ -122,6 +122,10 @@ class StreamClient(
     suspend fun connect() =
         withContext(Dispatchers.IO) {
             try {
+                // Capability enumeration can take longer than the Mac's 100 ms legacy grace.
+                // Finish it before opening TCP, otherwise the host can start HEVC before our
+                // AVC-only advertisement and never send the codec-selection message.
+                prepareAdvertisements()
                 socket =
                     Socket(host, port).apply {
                         tcpNoDelay = true
@@ -130,7 +134,6 @@ class StreamClient(
                 outputStream = java.io.DataOutputStream(socket?.getOutputStream())
                 streamCodecIsHevc = true
                 codecNegotiated = false
-                prepareAdvertisements()
                 advertiseAvcOnlyIfNeeded() // MUST precede type 8: type 8 can trigger the server's early protocol finish
                 advertiseDecoderLimits() // Also before type 8, for the same reason
                 advertiseDesktopGeometrySupport() // Likewise
@@ -299,6 +302,7 @@ class StreamClient(
     ) = withContext(Dispatchers.IO) {
         Log.i(TAG, "connectWireless: trying $host:$port (device=$deviceName, token bytes=${token.size})")
 
+        prepareAdvertisements()
         val s = openWirelessSocket()
         Log.i(
             TAG,
@@ -356,7 +360,6 @@ class StreamClient(
                 outputStream = java.io.DataOutputStream(s.getOutputStream())
                 streamCodecIsHevc = true
                 codecNegotiated = false
-                prepareAdvertisements()
                 advertiseAvcOnlyIfNeeded() // MUST precede type 8: type 8 can trigger the server's early protocol finish
                 advertiseDecoderLimits() // Also before type 8, for the same reason
                 advertiseDesktopGeometrySupport() // Likewise

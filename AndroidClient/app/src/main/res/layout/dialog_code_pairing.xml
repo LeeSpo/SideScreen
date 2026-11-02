@@ -9,7 +9,7 @@
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
         android:text="The code is shown under the QR in Side Screen on your Mac."
-        android:textColor="#99A0AF"
+        android:textColor="#444444"
         android:textSize="13sp"
         android:layout_marginBottom="16dp" />
 
@@ -17,7 +17,7 @@
         android:layout_width="wrap_content"
         android:layout_height="wrap_content"
         android:text="Mac address"
-        android:textColor="#99A0AF"
+        android:textColor="#444444"
         android:textSize="11sp"
         android:layout_marginBottom="4dp" />
 
@@ -36,7 +36,7 @@
         android:layout_width="wrap_content"
         android:layout_height="wrap_content"
         android:text="Port"
-        android:textColor="#99A0AF"
+        android:textColor="#444444"
         android:textSize="11sp"
         android:layout_marginBottom="4dp" />
 
@@ -54,7 +54,7 @@
         android:layout_width="wrap_content"
         android:layout_height="wrap_content"
         android:text="Pairing code"
-        android:textColor="#99A0AF"
+        android:textColor="#444444"
         android:textSize="11sp"
         android:layout_marginBottom="4dp" />
 
@@ -76,7 +76,7 @@
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
         android:text="With or without the dash — both work."
-        android:textColor="#7C8494"
+        android:textColor="#505050"
         android:textSize="11sp"
         android:layout_marginTop="4dp" />
 
@@ -84,7 +84,7 @@
         android:id="@+id/codePairError"
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
-        android:textColor="#FCA5A5"
+        android:textColor="#8B1A1A"
         android:textSize="12sp"
         android:layout_marginTop="10dp"
         android:visibility="gone" />
